@@ -1,0 +1,7 @@
+---
+server:  
+  thread_count: 4
+  listen_address: '127.0.0.1'
+  port: 8080
+locations:
+  - path: '/'
