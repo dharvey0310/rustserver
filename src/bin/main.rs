@@ -1,11 +1,8 @@
-use rustserver::ThreadPool;
 use serde::{Serialize, Deserialize};
+use futures_util::TryStreamExt;
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Method, Request, Response, Server as HyperServer, StatusCode};
 use std::fs;
-use std::io::prelude::*;
-use std::net::TcpStream;
-use std::net::TcpListener;
-use std::thread;
-use std::time::Duration;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Config {
@@ -25,47 +22,45 @@ struct Location {
     path: String,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read in the YAML config file
     let config_file = fs::read_to_string("config.yaml").unwrap();
     let config: Config = serde_yaml::from_str(&config_file).unwrap();
 
-    println!("{}", config.locations[0].path);
+    let service = make_service_fn(|_| async { Ok::<_, hyper::Error>(service_fn(handle_connection)) });
 
+    let listen_addr: std::net::SocketAddr = format!("{}:{}", config.server.listen_address, config.server.port).parse().unwrap();
 
-    let listener = TcpListener::bind(format!("{}:{}", config.server.listen_address, config.server.port)).unwrap();
-    let pool = ThreadPool::new(config.server.thread_count);
+    let web_server = HyperServer::bind(&listen_addr).serve(service);
+
+    let graceful = web_server.with_graceful_shutdown(shutdown_signal());
 
     println!("Server listening on port {}", config.server.port);
 
-    for stream in listener.incoming() {
-        let stream = stream.unwrap();
+    if let Err(e) = graceful.await {
+        eprintln!("server error: {}", e);
+    }
 
-        pool.execute(|| {
-            handle_connection(stream);
-        });
+    Ok(())
+}
+
+async fn handle_connection(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+    match (req.method(), req.uri().path()) {
+        (&Method::GET, "/") => {
+            let contents = fs::read_to_string("hello.html").unwrap();
+            Ok(Response::new(Body::from(contents)))
+        },
+
+        _ => {
+            let contents = fs::read_to_string("404.html").unwrap();
+            let mut not_found = Response::new(Body::from(contents));
+            *not_found.status_mut() = StatusCode::NOT_FOUND;
+            Ok(not_found)
+        }
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    let mut buffer = [0; 512];
-    stream.read(&mut buffer).unwrap();
-
-    let get = b"GET / HTTP/1.1\r\n";
-    let sleep = b"GET /sleep HTTP/1.1\r\n";
-
-    let (status_line, filename) = if buffer.starts_with(get) {
-        ("HTTP/1.1 200 OK\r\n\r\n", "hello.html")
-    } else if buffer.starts_with(sleep) {
-        thread::sleep(Duration::from_secs(5));
-        ("HTTP/1.1 200 OK\r\n\r\n", "hello.html")
-    } else {
-        ("HTTP/1.1 404 NOT FOUND\r\n\r\n", "404.html")
-    };
-
-    let contents = fs::read_to_string(filename).unwrap();
-    let response = format!("{}{}", status_line, contents);
-
-    stream.write(response.as_bytes()).unwrap();
-    stream.flush().unwrap();
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c().await.expect("failed to install CTRL+C signal handler");
 }
